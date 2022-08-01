@@ -6,40 +6,54 @@
 /*     Created by Yuki HATANAKA / Geospatial Information Authority of Japan */
 /*                                                                          */
 /*     ver.                                                                 */
-/*     4.0.0       2007.02.05 test version   Y. Hatanaka                    */
+/*     4.0.0       2007-02-05 test version   Y. Hatanaka                    */
 /*                  - CRINEX 1/3 for RINEX 2.x/3.x                          */
-/*     4.0.1       2007.05.08                                               */
+/*     4.0.1       2007-05-08                                               */
 /*                  - elimination of supports for VMS and SUN OS 4.1.x      */
 /*                  - output not to the current directory but the same      */
 /*                    directory as the input file.                          */
 /*                  - the same code for DOS and UNIX                        */
-/*     4.0.2       2007.06.07                                               */
+/*     4.0.2       2007-06-07                                               */
 /*                  - fixing incompatibility of argument and format         */
 /*                    string of printf.                                     */
-/*     4.0.3       2007.06.21                                               */
+/*     4.0.3       2007-06-21                                               */
 /*                  - nothing was changed from 4.0.2 except for the         */
 /*                    version string to be the same as crx2rnx.c            */
-/*     4.0.4       2009.06.31                Y. Hatanaka                    */
+/*     4.0.4       2009-06-31                Y. Hatanaka                    */
 /*                  - rename function getline to ggetline                   */
 /*                  - correct typos in error messages                       */
-/*     4.0.5       2012.07.1x                Y. Hatanaka                    */
+/*     4.0.5       2012-07-1x                Y. Hatanaka                    */
 /*                  - check length of input file name                       */
 /*                  - minor changes to suppress warning messages            */
 /*                    at compilation.                                       */
 /*                  - initialize "dummy" in main routine                    */
-/*     4.0.6       2014.03.24                Y. Hatanaka                    */
+/*     4.0.6       2014-03-24                Y. Hatanaka                    */
 /*                  - "include" statements are moved to the top.            */
 /*                  - Manipulation of file names in the new file naming     */
 /*                    convention (*.rnx/crx) is added.                      */
-/*     4.0.7       2015.XX.XX                Y. Hatanaka                    */
+/*     4.0.7       2016-04-14                Y. Hatanaka                    */
 /*                  - increase the following constants                      */
 /*                       MAXSAT        90     -> 100                        */
 /*                       MAXTYPE       50     -> 100                        */
 /*                       MAXCLM        1024   -> 2048                       */
 /*                       MAX_BUFF_SIZE 131072 -> 204800                     */
+/*     4.0.8       2019-07-12                Y. Hatanaka                    */
+/*                  - Correction of a bug which eliminates clock offset     */
+/*                    data periodically when used with the option "-e".     */
+/*                  - New option "-d" is added to delete input file after   */
+/*                    successful conversion.                                */
+/*     4.1.0       2021-12-16                Y. Hatanaka                    */
+/*                  - RINEX ver.4.xx files are accepted and converted to    */
+/*                    Compact RINEX ver. 3 format                           */
+/*                  - Following bugs are fixed:                             */
+/*                    + Error in case the number of special records exceeds */
+/*                      99 in RINEX ver.2 files                             */
+/*                    + Error in case clock offset is padded with spaces    */
+/*                      in RINEX ver. 3 or 4 files.                         */
+/*                    + Error in case a bad GNSS type is detected even if   */
+/*                      option -s is specified.                             */
 /*                                                                          */
 /*     Copyright (c) 2007 Geospatial Information Authority of Japan         */
-/*     All rights reserved.                                                 */
 /*                                                                          */
 /****************************************************************************/
 
@@ -50,7 +64,7 @@
 #include <ctype.h>
 #include <time.h>
 
-#define VERSION  "ver.4.0.7"
+#define VERSION  "ver.4.1.0"
 
 /**** Exit codes are defined here.   ****/
 #define EXIT_WARNING 2
@@ -63,7 +77,7 @@
 #define EXIT_SUCCESS 0
 #endif
 
-/*** define macro to  ***/
+/*** define macro to flush or clear the output buffer ***/
 #define FLUSH_BUFF printf("%s",top_buff), *(p_buff = top_buff)='\0'
 #define CLEAR_BUFF *(p_buff = top_buff) = '\0'
 
@@ -95,10 +109,12 @@ typedef struct data_format{
 long ep_count = 0;
 long ep_reset = 0;
 long nl_count = 0;
-int rinex_version;          /* =2 or 3 */
+int rinex_version;          /* =2, 3 or 4 */
 int nsat,ntype,ntype_gnss[UCHAR_MAX],ntype_record[MAXSAT],clk_order = -1;
 int exit_status = EXIT_SUCCESS;
 int skip_strange_epoch = 0; /* default : stop with error */
+int delete_if_no_error = 0; /* default : not delete */
+int n_infile = 0;           /* number of input file (must be 0 or 1) */
 
 /*
 clock_format clk1,clk0 = {0,0,0,0,0,0,0,0};
@@ -108,6 +124,7 @@ data_format dy0[MAXSAT][MAXTYPE], dy1[MAXSAT][MAXTYPE];
 char flag0[MAXSAT][MAXTYPE*2], flag[MAXSAT][MAXTYPE*2];
 char out_buff[MAX_BUFF_SIZE] = {'x','\0'};  /**** a character is put as a stopper to avoid memory overflow ****/
 char *top_buff=&out_buff[1],*p_buff;        /**** therefore, actual buffer start from the second character ****/
+char infile[MAXCLM];                        /**** name of input file ****/
 size_t C1  = sizeof("");               /* size of one character */
 size_t C2  = sizeof(" ");              /* size of 2-character string */
 size_t C3  = sizeof("  ");             /* size of 3-character string */
@@ -136,6 +153,7 @@ void putdiff(long dddu, long dddl);
 void put_clock(long du, long dl, int clk_order);
 int  read_chk_line(char *line);
 void error_exit(int error_no, char *string);
+void no_error_exit();
 
 /*---------------------------------------------------------------------*/
 int main(int argc, char *argv[]){
@@ -153,7 +171,7 @@ int main(int argc, char *argv[]){
         p_event  = &newline[28];  /** pointer to event flag **/
         p_nsat   = &newline[29];  /** pointer to n_sat **/
         p_satlst = &newline[32];  /** pointer to satellite list **/
-        p_satold = &oldline[32];  /** pointer to n_sat **/
+        p_satold = &oldline[32];  /** pointer to n_sat of the previous epoch **/
         p_clock  = &newline[68];  /** pointer to clock offset data **/
         shift_clk = 1;
     }else{
@@ -167,7 +185,7 @@ int main(int argc, char *argv[]){
 
     for(CLEAR_BUFF;;FLUSH_BUFF){
         SKIP:
-        if( ! get_next_epoch(newline) ) return exit_status;
+        if( ! get_next_epoch(newline) ) no_error_exit();
 
         /*** if event flag > 1, then (1)output event data  */
         /*** (2)initialize all data arcs, and continue to next epoch ***/
@@ -176,6 +194,8 @@ int main(int argc, char *argv[]){
             initialize_all(oldline,&nsat_old,0);
             continue;
         }
+
+        if( ep_reset > 0 && ++ep_count > ep_reset ) initialize_all(oldline,&nsat_old,1);
 
         if(strchr(newline,'\0') > p_clock){
             read_clock(p_clock,shift_clk);        /**** read clock offset ****/
@@ -186,7 +206,6 @@ int main(int argc, char *argv[]){
         nsat = atoi(p_nsat);
         if(nsat > MAXSAT) error_exit(8,newline);
         if(nsat > 12 && rinex_version == 2) read_more_sat(nsat,p_satlst);  /*** read continuation lines ***/
-        if( ep_reset > 0 && ++ep_count > ep_reset ) initialize_all(oldline,&nsat_old,1);
 
         /**** get observation ****/
         for(i=0,p=p_satlst ; i<nsat ; i++,p+=3) {
@@ -230,10 +249,10 @@ int main(int argc, char *argv[]){
 }
 /*---------------------------------------------------------------------*/
 void parse_args(int argc, char *argv[]){
-    char *p,infile[MAXCLM],outfile[MAXCLM],*progname;
-    int nfile = 0, force = 0, help = 0;
+    char *p,outfile[MAXCLM],*progname;
+    int force = 0, help = 0;
     int nfout = 0;  /*** =0 default output file name ***/
-                    /*** =1 standaed output          ***/
+                    /*** =1 standard output          ***/
     FILE *ifp;
 
     progname = argv[0];
@@ -241,11 +260,14 @@ void parse_args(int argc, char *argv[]){
     for(;argc>0;argc--,argv++){
         if((*argv)[0] != '-'){
             strncpy(infile,*argv,C1*MAXCLM);
-            nfile++;
+            n_infile++;
         }else if(strcmp(*argv,"-")   == 0){
             nfout = 1;                 /* output to standard output */
         }else if(strcmp(*argv,"-f")  == 0){
             force = 1;                 /* overwrite if the output file exists */
+        }else if(strcmp(*argv,"-d")  == 0){
+            delete_if_no_error = 1;    /* delete the original file if 
+                                          no error in the conversion */
         }else if(strcmp(*argv,"-s")  == 0){
             skip_strange_epoch = 1;
         }else if(strcmp(*argv,"-e")  == 0){
@@ -259,8 +281,8 @@ void parse_args(int argc, char *argv[]){
     }
 
     if(strlen(infile) == MAXCLM) error_exit(14,infile);
-    if(help == 1 || nfile > 1 || nfile < 0) error_exit(2,progname);
-    if(nfile == 0) return;       /*** stdin & stdout will be used ***/
+    if(help == 1 || n_infile > 1 || n_infile < 0) error_exit(1,progname);
+    if(n_infile == 0) return;  /*** stdin & stdout will be used if input file name is not given ***/
 
     /***********************/
     /*** open input file ***/
@@ -310,7 +332,7 @@ void header(void){
 
     rinex_version = atoi(line);
     if      ( rinex_version == 2 ){printf("%-20.20s",CRX_VERSION1);}
-    else if ( rinex_version == 3 ){printf("%-20.20s",CRX_VERSION2);}
+    else if ( rinex_version == 3 || rinex_version == 4 ){printf("%-20.20s",CRX_VERSION2);}
     else                          {error_exit(15,line);}
     printf("%-40.40s%-20.20s\n","COMPACT RINEX FORMAT","CRINEX VERS   / TYPE");
 
@@ -331,7 +353,7 @@ void header(void){
 /*---------------------------------------------------------------------*/
 int  get_next_epoch(char *p_line){
 /**** find next epoch line.                                                          ****/
-/**** If the line seems to be abnormal, print warning message                     ****/
+/**** If the line seems to be abnormal, print warning message                        ****/
 /**** and skip until next epoch is found                                             ****/
 /**** return value  0 : end of the file                                              ****/
 /****               1 : normal end                                                   ****/
@@ -352,20 +374,20 @@ int  get_next_epoch(char *p_line){
         exit_status = EXIT_WARNING;
         return 0;
     }
-    if( *(p-1) == '\r' )p--;                      /*** check DOS CR/LF ***/
+    if( *(p-1) == '\r' ){*(--p)='\0';};                   /*** remove DOS CR/LF ***/
+    while(*--p == ' ' && p>p_line){};*++p = '\0';         /*** chop blank ***/
 
     if (rinex_version == 2) {
-        while(*--p == ' ' && p>p_line){};*++p = '\0';   /*** chop blank ***/
         if( strlen(p_line)<29   || *p_line != ' '
                 ||  *(p_line+27) != ' ' || ! isdigit(*(p_line+28))
-                || (*(p_line+29) != ' ' && *(p_line+29) != '\0') ) {
+                || (*(p_line+29) != ' ' && ! isdigit(*(p_line+29)) && *(p_line+29) != '\0') ) {
             /**** ------- something strange is found in the epoch line ****/
             if( ! skip_strange_epoch ) error_exit(6,p_line);
             if(*(p_line+18) != '.')  CLEAR_BUFF;
             skip_to_next(p_line);
             return 2;
         }
-    }else{
+    }else{    /* rinex_version == 3 or 4 */
         if( *p_line != '>' ){
             if( ! skip_strange_epoch ) error_exit(6,p_line);
             CLEAR_BUFF;
@@ -598,8 +620,12 @@ int  ggetline(data_format *py1, char *flag, char *sat_id, int *ntype_rec){
         p_1st_rec = line;                          /** pointer to the start of the first record **/
     }else{                                /** for RINEX3 **/
         strncpy(sat_id,line,C3);                   /** put satellite ID to the list of satellites **/
-        max_field = *ntype_rec = ntype_gnss[(unsigned int)line[0]];  /*** # of data type for the GNSS system ***/
-        if(max_field<0) error_exit(21,line);
+        max_field = *ntype_rec = ntype_gnss[(unsigned int)line[0]];  /*** # of data types for the GNSS system ***/
+        if(max_field<0) {
+           if( ! skip_strange_epoch ) error_exit(21,line);
+           fprintf(stderr,"WARNING at line %ld. : GNSS type '%c' is not defined in the header. ... skip\n",nl_count,(unsigned int)line[0]);
+           return 1;
+        }
         p_1st_rec = line+3;
     }
     for(i=0;i<*ntype_rec;i+=max_field){                 /* for each line */
@@ -743,13 +769,8 @@ int  read_chk_line(char *line){
 /*---------------------------------------------------------------------*/
 void error_exit(int error_no, char *string){
     if(error_no == 1 ){
-        fprintf(stderr,"Usage: %s input file [-o output file] [-f] [-e # of epochs] [-s] [-h]\n",string);
-        fprintf(stderr,"    output file name can be omitted if input file name is *.[yy]o\n");
-    }else if(error_no == 2 ){
-        fprintf(stderr,"Usage: %s [file] [-] [-f] [-e # of epochs] [-s] [-h]\n",string);
+        fprintf(stderr,"Usage: %s [file] [-] [-f] [-e # of epochs] [-s] [-d] [-h]\n",string);
         fprintf(stderr,"    stdin and stdout are used if input file name is not given.\n");
-    }
-    if(error_no == 1 || error_no == 2){
         fprintf(stderr,"    -       : output to stdout\n");
         fprintf(stderr,"    -f      : force overwrite of output file\n");
         fprintf(stderr,"    -e #    : initialize the compression operation at every # epochs\n");
@@ -759,6 +780,9 @@ void error_exit(int error_no, char *string){
         fprintf(stderr,"              increase chances to recover parts of data by using an option of\n");
         fprintf(stderr,"              CRX2RNX(ver. 4.0 or after) with cost of increase of file size.\n");
         fprintf(stderr,"    -s      : warn and skip strange epochs (default: stop with error status)\n");
+        fprintf(stderr,"    -d      : delete the input file if conversion finishes without errors\n");
+        fprintf(stderr,"              (i.e. exit code = %d or %d).\n",EXIT_SUCCESS,EXIT_WARNING);
+        fprintf(stderr,"              This option does nothing if stdin is used for the input.\n");
         fprintf(stderr,"    -h      : display this message\n\n");
         fprintf(stderr,"    exit code = %d (success)\n",EXIT_SUCCESS);
         fprintf(stderr,"              = %d (error)\n",  EXIT_FAILURE);
@@ -768,7 +792,7 @@ void error_exit(int error_no, char *string){
     }
     if(error_no == 4 ){
         fprintf(stderr,"ERROR : invalid file name  %s\n",string);
-        fprintf(stderr,"The extension of the input file name should be [.xxo] or [.rnx].\n");
+        fprintf(stderr,"The extension of the input file name should be [.??o] or [.rnx].\n");
         fprintf(stderr,"To convert the files whose name is not fit to the above conventions,\n");
         fprintf(stderr,"use of this program as a filter is also possible. \n");
         fprintf(stderr,"    for example)  cat file.in | %s - > file.out\n",PROGNAME);
@@ -827,7 +851,7 @@ void error_exit(int error_no, char *string){
     if(error_no == 15 ){
         fprintf(stderr,"The first line is :\n%s\n\n",string);
         fprintf(stderr,"ERROR : The file format is not valid. This program is applicable\n");
-        fprintf(stderr,"        only to RINEX Version 2/3 Observation file.\n");
+        fprintf(stderr,"        only to RINEX Version 2/3/4 Observation file.\n");
         exit(EXIT_FAILURE);
     }
     if(error_no == 16 ){
@@ -841,9 +865,13 @@ void error_exit(int error_no, char *string){
         exit(EXIT_FAILURE);
     }
     if(error_no == 21 ){
-        fprintf(stderr,"ERROR at line %ld. : GNSS type is not defined in the header.\n",nl_count);
+        fprintf(stderr,"ERROR at line %ld. : GNSS type '%c' is not defined in the header.\n",nl_count,(unsigned int)string[0]);
         fprintf(stderr,"     start>%s<end\n",string);
         exit(EXIT_FAILURE);
     }
 }
-
+/*---------------------------------------------------------------------*/
+void no_error_exit() {
+    if (delete_if_no_error && exit_status != 2 && n_infile == 1)  remove(infile);
+    exit(exit_status);
+}
